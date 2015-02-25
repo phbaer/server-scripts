@@ -1,0 +1,218 @@
+#!/bin/bash
+# 2009-2015 phbaer
+# Update 2015-02-25
+
+# General configuration settings
+CONF_LOGFILE="/var/log/backup.log"
+CONF_FILELIST_TEMP="/tmp/backup.files"
+CONF_DUPLICITY_BINARY="duplicity"
+
+# Remote SFTP configuration
+REMOTE_USER="<username>" # Must not be empty
+REMOTE_PASSWORD="<password>" # Must not be empty
+REMOTE_HOST="<server>" # Must not be empty
+REMOTE_LFTP_PROTOCOL="sftp"
+REMOTE_DUPLICITY_PROTOCOL="ftp"
+
+# GPG passphrase with which the backup is encrypted.
+# Must not be empty
+GPG_PASSPHRASE="<GPG passphrase>"
+
+# MySQL properties.
+# Leave MYSQL_USER empty if it shall be skipped.
+MYSQL_USER="<mysql username>"
+MYSQL_PASSWORD="<mysql password>"
+MYSQL_TEMP_DIR="/tmp/mysql-dump"
+
+# Backup user home settings (based on config file $HOME and Maildir contents).
+# User .backup files just list all directories (relative to their home) which should be backed up (very simple, may be exploited by malicious users)
+# Leave empty if it shall be skipped.
+USER_HOME="/home"
+USER_HOME_CONFIG=".backup"
+
+# Some directory under which the backup will be stored, shall not be empty
+BACKUP_NAME="<backup id, some name>"
+BACKUP_DIRS="/etc $MYSQL_TEMP_DIR /opt ..." # Must not be empty
+BACKUP_MAX_AGE="2W"
+BACKUP_DO_FULL="1W"
+
+# *** Do not change values below this line ***
+
+log()
+{
+	echo "[`date +'%F %T'`] $1" >> $CONF_LOGFILE 2>&1
+}
+
+do_backup()
+{
+	log "Backup of $BACKUP_NAME: started"
+
+	if [ -z "$BACKUP_NAME" ]; then
+		log "Backing up databases for $BACKUP_NAME"
+		return 2
+	fi
+
+	BACKUP_DIRS_TEMP=$BACKUP_DIRS
+	BACKUP_DIRS=""
+
+	OPTIONS="--full-if-older-than $BACKUP_DO_FULL "
+
+	BACKUP_NAME_EXISTS=`echo ls | lftp -u $REMOTE_USER,$REMOTE_PASSWORD $REMOTE_LFTP_PROTOCOL://$REMOTE_HOST | grep $BACKUP_NAME`
+
+	# Prepare remote directory
+	if [ -z "$BACKUP_NAME_EXISTS" ]; then
+		MSG="`mkdir $BACKUP_NAME | lftp -u $REMOTE_USER,$REMOTE_PASSWORD $REMOTE_LFTP_PROTOCOL://$REMOTE_HOST`"
+		log "$MSG"
+	fi
+
+	# Stage 1: Backup mysql databases
+	if [ -n "$MYSQL_USER" ]; then
+		log "Backing up databases for $BACKUP_NAME"
+
+		rm -R $MYSQL_TEMP_DIR &> /dev/null
+		mkdir -p $MYSQL_TEMP_DIR &> /dev/null
+
+		mysqldump --all-databases -u "$MYSQL_USER" --password="$MYSQL_PASSWORD" > $MYSQL_TEMP_DIR/databases.sql &> /dev/null
+	fi
+
+	# Stage 2: Backup user homes using .backup file and Maildir contents (optional)
+	if [ -n "$USER_HOME" ]; then
+		BACKUP_DIRS_TEMP=""
+
+		# Add all Maildir directories in all homes
+		# Optionally, read the .backup file that contains additions directories to be backed up
+		for I in `ls $USER_HOME`; do
+			BACKUP_DIRS_TEMP="$BACKUP_DIRS_TEMP $USER_HOME/$I/Maildir"
+			if [ -f $USER_HOME/$I/$USER_HOME_CONFIG ]; then
+				for J in `cat $USER_HOME/$I/$USER_HOME_CONFIG`; do
+					# Add to the remporary list of directories to be backed up
+					BACKUP_DIRS_TEMP="$BACKUP_DIRS_TEMP $USER_HOME/$I/$J"
+				done
+			fi
+		done
+
+		# Expand all directories and only include existing ones (they may be relative)
+		log "Adding user-defined directories to the backup:"
+		for I in $BACKUP_DIRS_TEMP; do
+			if [ -d "$I" ]; then
+				CURDIR=$PWD
+				cd $I
+				# Add to the list of actually backed up directories
+				log "+ $PWD"
+				BACKUP_DIRS="$BACKUP_DIRS $PWD"
+				cd $CURDIR
+			fi
+		done
+	fi
+
+	# Removed duplicates in the directories to be backed up
+	BACKUP_DIRS=`echo $BACKUP_DIRS | uniq`
+
+	# Stage 3: Back up the stuff
+	for I in $BACKUP_DIRS; do
+		# Get rid of all leading and trailing slashes
+		TARGET=`echo $I | sed "s/^\///g" | sed "s/\/$//g"`
+
+		TARGET_EXISTS=`echo ls | lftp -u $REMOTE_USER,$REMOTE_PASSWORD $REMOTE_LFTP_PROTOCOL://$REMOTE_HOST/$BACKUP_NAME | grep $BACKUP_NAME/$TARGET`
+		if [ -z "$TARGET_EXISTS" ]; then
+			MSG="`mkdir -p $BACKUP_NAME/$TARGET | lftp -u $REMOTE_USER,$REMOTE_PASSWORD $REMOTE_LFTP_PROTOCOL://$REMOTE_HOST`"
+			log "$MSG"
+		fi
+
+		log "Removing old backup sets for $BACKUP_NAME:$I"
+		FTP_PASSWORD=$REMOTE_PASSWORD PASSPHRASE=$GPG_PASSPHRASE $CONF_DUPLICITY_BINARY remove-older-than $BACKUP_MAX_AGE --force $REMOTE_DUPLICITY_PROTOCOL://$REMOTE_USER@$REMOTE_HOST/$BACKUP_NAME/$TARGET >> $CONF_LOGFILE 2>&1
+
+		log "Backing up $BACKUP_NAME:$I"
+		FTP_PASSWORD=$REMOTE_PASSWORD PASSPHRASE=$GPG_PASSPHRASE $CONF_DUPLICITY_BINARY $I $OPTIONS $REMOTE_DUPLICITY_PROTOCOL://$REMOTE_USER@$REMOTE_HOST/$BACKUP_NAME/$TARGET >> $CONF_LOGFILE 2>&1
+	done
+
+	# Stage 4: Cleanup
+	log "Cleaning up"
+	if [ -n "$MYSQL_USER" ]; then
+		rm -R /tmp/mysql-dump &> /dev/null
+	fi
+
+	log "Backup of $BACKUP_NAME: done"
+}
+
+do_list()
+{
+	if [ -e $1 ]; then
+		IFS_OLD=$IFS
+		IFS=$'\n'
+		SPACE=`echo du -h $BACKUP_NAME | lftp -u $REMOTE_USER,$REMOTE_PASSWORD $REMOTE_LFTP_PROTOCOL://$REMOTE_HOST`
+		echo Backup destination: $BACKUP_NAME
+		echo Directories:
+		for I in $SPACE; do
+			T=`echo $I | sed "s/${BACKUP_NAME}\///g"`
+			echo "*" $T
+		done
+		IFS=$IFS_OLD
+	else
+		INFO=`echo du -h $BACKUP_NAME | lftp -u $REMOTE_USER,$REMOTE_PASSWORD $REMOTE_LFTP_PROTOCOL://$REMOTE_HOST`
+		FTP_PASSWORD=$REMOTE_PASSWORD PASSPHRASE=$GPG_PASSPHRASE $CONF_DUPLICITY_BINARY list-current-files $REMOTE_DUPLICITY_PROTOCOL://$REMOTE_USER@$REMOTE_HOST/$BACKUP_NAME/$1 > /tmp/backup.files
+		less $CONF_FILELIST_TEMP
+		if [ "$2" != "keep" ]; then
+			rm $CONF_FILELIST_TEMP
+		fi
+	fi
+}
+
+do_info()
+{
+	if [ ! -z $1 ]; then
+		FTP_PASSWORD=$REMOTE_PASSWORD PASSPHRASE=$GPG_PASSPHRASE $CONF_DUPLICITY_BINARY collection-status $REMOTE_DUPLICITY_PROTOCOL://$REMOTE_USER@$REMOTE_HOST/$BACKUP_NAME/$1
+	fi
+}
+
+do_restore()
+{
+	if [ ! -z $1 ]; then
+		if [ ! -z $2 ]; then
+			if [ -z $3 ]; then
+				FTP_PASSWORD=$REMOTE_PASSWORD PASSPHRASE=$GPG_PASSPHRASE $CONF_DUPLICITY_BINARY restore --time 1D $REMOTE_DUPLICITY_PROTOCOL://$REMOTE_USER@$REMOTE_HOST/$BACKUP_NAME/$2 $1
+			else
+				if [ ! -d $1 ]; then
+					mkdir -p $1
+				fi
+				FTP_PASSWORD=$REMOTE_PASSWORD PASSPHRASE=$GPG_PASSPHRASE $CONF_DUPLICITY_BINARY restore --time 1D --file-to-restore=$3 $REMOTE_DUPLICITY_PROTOCOL://$REMOTE_USER@$REMOTE_HOST/$2 $1/$3
+			fi
+		fi
+	fi
+}
+
+case "$1" in
+	help)
+		echo $0
+		echo "help"
+		echo "list [<dir>] [keep]"
+		echo "if no argument is given, all backed directories are listed"
+		echo "+ <dir>     backed up directory (optional)"
+		echo "+ keep      keep $CONF_FILELIST_TEMP (optional)"
+		echo ""
+		echo "info [<dir>]"
+		echo "+ <dir>     backed up directory"
+		echo ""
+		echo "restore [<target>] [<dir>] [<file>]" 
+		echo "+ <target>  backed up directory"
+		echo "+ <dir>     backed up directory"
+		echo "+ <file>    filename (optional)"
+		;;
+
+	list)
+		do_list $2 $3
+		;;
+
+	info)
+		do_info $2
+		;;
+
+	restore)
+		do_restore $2 $3 $4
+		;;
+
+	*)
+		do_backup
+		;;
+esac
+
